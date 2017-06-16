@@ -11,8 +11,8 @@ import (
 	"github.com/chenziliang/splunk"
 )
 
-func getEvents(sourcetype string) []*splunk.Event {
-	data := map[string]interface{}{"cf_origin": "firehose", "deployment": "cf", "event_type": "ValueMetric", "ip": "192.168.16.26", "job": "doppler", "job_index": "5a634d0b-bbc5-47c4-9450-a43f44a7fd30", "name": "messageRouter.numberOfFirehoseSinks", "origin": "DopplerServer", "unit": "sinks", "value": 1}
+func getEvents(sourcetype, transaction string) []*splunk.Event {
+	data := map[string]interface{}{"cf_origin": "firehose", "deployment": "cf", "event_type": "ValueMetric", "ip": "192.168.16.26", "job": "doppler", "job_index": "5a634d0b-bbc5-47c4-9450-a43f44a7fd30", "name": "messageRouter.numberOfFirehoseSinks", "origin": "DopplerServer", "unit": "sinks", "value": 1, "transaction": transaction}
 
 	var events []*splunk.Event
 	for i := 0; i < 1000; i++ {
@@ -28,7 +28,7 @@ func getEvents(sourcetype string) []*splunk.Event {
 	return events
 }
 
-func (p *hecPerf) asyncPost(idx, totalEvents int) {
+func (p *HecPerf) asyncPost(idx, totalEvents int) {
 	client, err := splunk.NewHttpEventAsyncClient([]string{p.hecURI}, []string{p.hecToken})
 	if err != nil {
 		fmt.Printf("workerId=%d Failed tto create client, err=%+v\n", idx, err)
@@ -39,7 +39,7 @@ func (p *hecPerf) asyncPost(idx, totalEvents int) {
 
 LOOP:
 	for {
-		events := getEvents("hec:async")
+		events := getEvents("hec:async", p.transaction)
 		err := client.WriteEvents(events)
 		if err != nil {
 			fmt.Printf("workerId=%d Failed to write events, error=%+v\n", idx, err)
@@ -48,14 +48,14 @@ LOOP:
 
 		sent += len(events)
 		if sent >= totalEvents {
-			fmt.Printf("workerId=%d done with total_events=%d\n", idx, totalEvents)
+			fmt.Printf("workerId=%d done With total_events=%d\n", idx, totalEvents)
 			break LOOP
 		}
 	}
 	p.workers.Done()
 }
 
-func (p *hecPerf) syncPost(idx, totalEvents int) {
+func (p *HecPerf) syncPost(idx, totalEvents int) {
 	client, err := splunk.NewHttpEventSyncClient(p.hecURI, p.hecToken)
 	if err != nil {
 		fmt.Printf("workerId=%d Failed tto create client, err=%+v\n", idx, err)
@@ -69,7 +69,7 @@ func (p *hecPerf) syncPost(idx, totalEvents int) {
 
 OUTLOOP:
 	for {
-		events := getEvents("hec:sync")
+		events := getEvents("hec:sync", p.transaction)
 		ids, err := client.WriteEvents(events)
 		if err != nil {
 			fmt.Printf("workerId=%d Failed to write events, error=%+v\n", idx, err)
@@ -105,14 +105,14 @@ OUTLOOP:
 		}
 
 		if sent >= totalEvents {
-			fmt.Printf("workerId=%d done with total_events=%d\n", idx, totalEvents)
+			fmt.Printf("workerId=%d done With total_events=%d\n", idx, totalEvents)
 			break OUTLOOP
 		}
 	}
 	p.workers.Done()
 }
 
-type hecPerf struct {
+type HecPerf struct {
 	hecURI       string
 	hecToken     string
 	concurrency  int
@@ -120,35 +120,145 @@ type hecPerf struct {
 	pollInterval time.Duration
 	totalEvents  int
 	syncMode     bool
+	transaction  string
 	workers      sync.WaitGroup
 }
 
-func newHecPerf(hecURI, hecToken string, concurrency, totalEvents, pollLimit int, pollInterval time.Duration, syncMode bool) *hecPerf {
-	return &hecPerf{
+func NewHecPerf(hecURI, hecToken string) *HecPerf {
+	return &HecPerf{
 		hecURI:       hecURI,
 		hecToken:     hecToken,
-		concurrency:  concurrency,
-		pollLimit:    pollLimit,
-		pollInterval: pollInterval,
-		totalEvents:  totalEvents,
-		syncMode:     syncMode,
+		concurrency:  1,
+		pollLimit:    10000,
+		pollInterval: time.Second,
+		totalEvents:  1000000,
+		syncMode:     true,
+		transaction:  uuid.New().String(),
 	}
 }
 
-func (p *hecPerf) Start() {
+func (p *HecPerf) WithConcurrency(concurrency int) *HecPerf {
+	p.concurrency = concurrency
+	return p
+}
+
+func (p *HecPerf) WithPollLimit(pollLimit int) *HecPerf {
+	p.pollLimit = pollLimit
+	return p
+}
+
+func (p *HecPerf) WithPollInterval(pollInterval time.Duration) *HecPerf {
+	p.pollInterval = pollInterval
+	return p
+}
+
+func (p *HecPerf) WithTotalEvents(totalEvents int) *HecPerf {
+	p.totalEvents = totalEvents
+	return p
+}
+
+func (p *HecPerf) WithSyncMode(syncMode bool) *HecPerf {
+	p.syncMode = syncMode
+	return p
+}
+
+func (p *HecPerf) writeMeta(event *splunk.Event) error {
+	if p.syncMode {
+		event.Sourcetype = "hec:sync"
+		client, err := splunk.NewHttpEventSyncClient(p.hecURI, p.hecToken)
+		if err != nil {
+			fmt.Printf("Failed to create client, err=%+v\n", err)
+			return err
+		}
+
+		_, err = client.WriteEvents([]*splunk.Event{event})
+		if err != nil {
+			fmt.Printf("Failed to write transaction info, err=%+v\n", err)
+		}
+		return err
+	} else {
+		event.Sourcetype = "hec:async"
+		client, err := splunk.NewHttpEventAsyncClient([]string{p.hecURI}, []string{p.hecToken})
+		if err != nil {
+			fmt.Printf("Failed to create client, err=%+v\n", err)
+			return err
+		}
+
+		err = client.WriteEvents([]*splunk.Event{event})
+		if err != nil {
+			fmt.Printf("Failed to write transaction info, err=%+v\n", err)
+		}
+		return err
+	}
+}
+
+func (p *HecPerf) writeTxn(meta map[string]interface{}) error {
+	data := map[string]interface{}{
+		"concurrency":   p.concurrency,
+		"poll-limit":    p.pollLimit,
+		"poll-interval": int(p.pollInterval / time.Millisecond),
+		"total-events":  p.totalEvents,
+		"sync-mode":     p.syncMode,
+		"transaction":   p.transaction,
+		"time": time.Now().UnixNano(),
+	}
+
+	for k, v := range meta {
+		data[k] = v
+	}
+
+	event := &splunk.Event{
+		Timestamp:  time.Now().Unix(),
+		Source:     "hec-client",
+		Host:       "localhost",
+		Data:       data,
+	}
+
+	return p.writeMeta(event)
+}
+
+func (p *HecPerf) Start() error {
+	fmt.Printf("Start producing txn=%s total-events=%d concurrency=%d poll-limit=%d sync-mode=%t\n",
+		p.transaction, p.totalEvents, p.concurrency, p.pollLimit, p.syncMode)
+	start := time.Now().UnixNano()
+
+	var err error
+	defer func() {
+		if err != nil {
+			return
+		}
+
+		cost := time.Now().UnixNano() - start
+		eps := int64(p.totalEvents)*int64(1000000000)/cost
+		fmt.Printf("End of producing txn=%s total-events=%d concurrency=%d poll-limit=%d sync-mode=%t took=%d nanoseconds eps=%d\n",
+			p.transaction, p.totalEvents, p.concurrency, p.pollLimit, p.syncMode, cost, eps)
+
+		data := map[string]interface{}{
+			"cost": cost,
+			"eps": eps,
+		}
+
+		p.writeTxn(data)
+	}()
+
+	err = p.writeTxn(nil)
+	if err != nil {
+		return err
+	}
+
 	fun := p.syncPost
 	if !p.syncMode {
 		fun = p.asyncPost
 	}
 
 	shared := p.totalEvents / p.concurrency
-	for i := 0; i < p.concurrency-1; i++ {
+	for i := 0; i < p.concurrency; i++ {
 		p.workers.Add(1)
 		go fun(i, shared)
 	}
 
-	go fun(p.concurrency, shared)
 	p.workers.Wait()
+	return nil
 }
 
 func main() {
@@ -167,12 +277,12 @@ func main() {
 		return
 	}
 
-	perf := newHecPerf(*hecURI, *hecToken, *concurrency, *totalEvents, *pollLimit, *pollInterval, *syncMode)
-	fmt.Printf("Start producing total_events=%d concurrency=%d poll_limit=%d sync_mode=%t\n",
-		*totalEvents, *concurrency, *pollLimit, *syncMode)
-	start := time.Now().UnixNano()
+	perf := NewHecPerf(*hecURI, *hecToken)
+	perf.WithConcurrency(*concurrency).
+		WithPollLimit(*pollLimit).
+		WithPollInterval(*pollInterval).
+		WithTotalEvents(*totalEvents).
+		WithSyncMode(*syncMode)
+
 	perf.Start()
-	cost := time.Now().UnixNano() - start
-	fmt.Printf("End of producing total_events=%d concurrency=%d poll-limit=%d sync_mode=%t took=%d nanoseconds eps=%d\n",
-		*totalEvents, *concurrency, *pollLimit, *syncMode, cost, int64(*totalEvents)*int64(1000000000)/cost)
 }
