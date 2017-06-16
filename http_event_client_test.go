@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestHttpEventClient(t *testing.T) {
+func TestHttpEventAsyncClient(t *testing.T) {
 	e := "i love you"
 	ee, _ := json.Marshal(&e)
 	e2 := map[string]string{
@@ -27,7 +27,7 @@ func TestHttpEventClient(t *testing.T) {
 
 	serverURIs := []string{"https://localhost:8088"}
 	tokens := []string{"810E895F-820A-4591-BB7F-0B1D805924FB"}
-	client, err := NewHttpEventClient(serverURIs, tokens)
+	client, err := NewHttpEventAsyncClient(serverURIs, tokens)
 	if err != nil {
 		t.Errorf("Failed to create client, error=%s", err)
 	}

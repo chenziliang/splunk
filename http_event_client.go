@@ -9,7 +9,12 @@ import (
 	"github.com/pquerna/ffjson/ffjson"
 )
 
-var headers = map[string]string{"Content-Type": "application/json", "Connection": "keep-alive"}
+var (
+	hecHeaders = map[string]string{
+		"Content-Type": "application/json",
+		"Connection": "keep-alive",
+	}
+)
 
 type Event struct {
 	Source     string      `json:"source" binding:"required"`
@@ -20,16 +25,16 @@ type Event struct {
 	Data       interface{} `json:"event" binding:"required"`
 }
 
-type HttpEventClient struct {
+type httpEventClient struct {
 	clients         []*RestClient
 	retries         int
 	httpPayloadSize int
 }
 
-// NewHttpEventClient
+// newhttpEventClient
 // serverURIs: ["https://indexer1:8088", "https://indexer2:8088",...],
 // tokens":    [uuid1,uuid2,...]
-func NewHttpEventClient(serverURIs []string, tokens []string) (*HttpEventClient, error) {
+func newHttpEventClient(serverURIs, tokens []string) (*httpEventClient, error) {
 	if len(serverURIs) != len(tokens) && len(tokens) != 1 {
 		return nil, errors.New("serverURI and token number is not matched")
 	}
@@ -47,61 +52,75 @@ func NewHttpEventClient(serverURIs []string, tokens []string) (*HttpEventClient,
 		clients = append(clients, client)
 	}
 
-	return &HttpEventClient{
+	return &httpEventClient{
 		clients: clients,
 		retries: 3,
 	}, nil
 }
 
-func (hec *HttpEventClient) WithRetries(retries int) *HttpEventClient {
+func (hec *httpEventClient) WithRetries(retries int) *httpEventClient {
 	hec.retries = retries
 	return hec
 }
 
-func (hec *HttpEventClient) WithHttpPayloadSize(maxBytes int) *HttpEventClient {
+func (hec *httpEventClient) WithHttpPayloadSize(maxBytes int) *httpEventClient {
 	hec.httpPayloadSize = maxBytes
 	return hec
 }
 
-func (hec *HttpEventClient) WriteEvents(events []*Event) error {
-	var err error
-	allData := hec.prepareData(events)
-	for _, data := range allData {
-		for i := 0; i < hec.retries; i++ {
-			err = hec.doWriteEvents(data)
-			if err == nil {
-				break
-			}
-		}
+func getHeaders(headers map[string]string) map[string]string {
+	if headers == nil {
+		return hecHeaders
 	}
-	return err
+
+	h := make(map[string]string, len(hecHeaders) + len(headers))
+	for k, v := range hecHeaders {
+		h[k] = v
+	}
+
+	for k, v := range headers {
+		h[k] = v
+	}
+
+	return h
 }
 
-func (hec *HttpEventClient) doWriteEvents(data []byte) error {
+func (hec *httpEventClient) doWriteEvents(data []byte, headers map[string]string) ([]byte, error) {
+	return hec.post("/services/collector", data, headers)
+}
+
+func (hec *httpEventClient) post(uri string, data []byte, headers map[string]string) ([]byte, error) {
 	start := 0
 	if len(hec.clients) > 1 {
-		rand.Seed(time.Now().UTC().Unix())
+		rand.Seed(time.Now().UTC().UnixNano())
 		start = rand.Intn(len(hec.clients))
 	}
 
-	var err error
+	var (
+		err  error
+		resp []byte
+	)
+
+	h := getHeaders(headers)
+
 	for i := 0; i < len(hec.clients); i++ {
 		client := hec.clients[start]
-		_, err = client.Request("/services/collector", "POST", headers, data, 1)
+		resp, err = client.Request(uri, "POST", h, data, 1)
 		if err == nil {
-			return nil
+			return resp, nil
 		}
 
 		errStr := err.Error()
 		if strings.Contains(errStr, "No data") || strings.Contains(errStr, "invalid-event-number") {
-			return err
+			return nil, err
 		}
 		start = (start + 1) % len(hec.clients)
 	}
-	return err
+
+	return nil, err
 }
 
-func (hec *HttpEventClient) prepareData(events []*Event) [][]byte {
+func (hec *httpEventClient) prepareData(events []*Event) [][]byte {
 	allData := make([][]byte, 0, 1)
 	var data []byte
 	for _, event := range events {

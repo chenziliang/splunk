@@ -16,7 +16,7 @@ import (
 )
 
 type SplunkDataPump struct {
-	clients     []*splunk.HttpEventClient
+	clients     []*splunk.HttpEventAsyncClient
 	workersWG   sync.WaitGroup
 	totalEvents int64
 	batchCount  int
@@ -30,11 +30,11 @@ type SplunkDataPump struct {
 }
 
 func NewSplunkDataPump(uris string, tokens string, concurrency int, rawEvent interface{}) (*SplunkDataPump, error) {
-	var clients []*splunk.HttpEventClient
+	var clients []*splunk.HttpEventAsyncClient
 	uriArray := strings.Split(uris, ",")
 	tokenArray := strings.Split(tokens, ",")
 	for i := 0; i < concurrency; i++ {
-		client, err := splunk.NewHttpEventClient(uriArray, tokenArray)
+		client, err := splunk.NewHttpEventAsyncClient(uriArray, tokenArray)
 		if err != nil {
 			return nil, err
 		}
@@ -105,19 +105,26 @@ func (dp *SplunkDataPump) concurrency() int64 {
 	return int64(len(dp.clients))
 }
 
-func (dp *SplunkDataPump) indexEvents(idx int) {
-	if dp.eps < 0 {
-		dp.indexEventsAsFastAsPossible(idx)
-		return
+func (dp *SplunkDataPump) newEvent() *splunk.Event {
+	return &splunk.Event{
+		Index:      dp.index,
+		Sourcetype: dp.sourcetype,
+		Source:     dp.source,
+		Data:       dp.rawEvent,
+		Timestamp:  time.Now().UnixNano(),
 	}
+}
 
-	durationPerEvent := time.Duration(int64(time.Second) / int64(dp.eps))
-	ticker := time.NewTicker(durationPerEvent)
-	tickerChan := ticker.C
-	eventsChan := make(chan *splunk.Event, dp.eps+1)
+func (dp *SplunkDataPump) produce(events chan *splunk.Event, numOfEvents int64) {
+	event := dp.newEvent()
+	for i := int64(0); i < numOfEvents; i++ {
+		t := time.Now().UnixNano()
+		event.Timestamp = t
+		events <- event
+	}
+}
 
-	go dp.doIndexEvents(eventsChan, idx)
-
+func (dp *SplunkDataPump) getShare(idx int) int64 {
 	shared := int64(-1)
 	if dp.totalEvents > 0 {
 		if idx == 0 {
@@ -126,42 +133,62 @@ func (dp *SplunkDataPump) indexEvents(idx int) {
 			shared = dp.totalEvents / dp.concurrency()
 		}
 	}
+	return shared
+}
 
-	startTime := time.Now().UnixNano()
+func (dp *SplunkDataPump) indexEvents(idx int) {
+	if dp.eps < 0 {
+		dp.indexEventsAsFastAsPossible(idx)
+		return
+	}
+
+	eventsChan := make(chan *splunk.Event, dp.eps+1)
+	go dp.doIndexEvents(eventsChan, idx)
+
+	shared := dp.getShare(idx)
+	// 5 seconds as a window
+	windowEvents := int64(dp.eps * 5)
+	windowDuration := time.Duration(5) * time.Second
+
 	eventSent := int64(0)
-	LOOP:
+	start := time.Now().UnixNano()
+
+LOOP:
 	for {
+		produceStart := time.Now().UnixNano()
+		if dp.totalEvents > 0 && eventSent+windowEvents > dp.totalEvents {
+			windowEvents = eventSent + windowEvents - dp.totalEvents
+		}
+		dp.produce(eventsChan, windowEvents)
+		eventSent += windowEvents
+		duration := time.Duration(time.Now().UnixNano() - produceStart)
+		if duration < windowDuration {
+			fmt.Printf("Too fast, sleep %d nano-seconds\n", int64(windowDuration-duration))
+			time.Sleep(windowDuration - duration)
+		} else {
+			fmt.Printf("Too slow, over committed=%d nano-seconds\n", int64(duration-windowDuration))
+		}
+
+		if eventSent%int64(dp.eps) == 0 {
+			duration := time.Now().UnixNano() - start
+			fmt.Printf("Generated %d events in %d nano-seconds, actual_eps=%d, required_eps=%d\n",
+				eventSent, duration, eventSent*1000000000/duration, dp.eps)
+		}
+
+		if shared > 0 && eventSent >= shared {
+			break LOOP
+		}
+
 		select {
 		case <-dp.cancelChan:
 			break LOOP
-		case t := <-tickerChan:
-			event := &splunk.Event{
-				Index:      dp.index,
-				Sourcetype: dp.sourcetype,
-				Source:     dp.source,
-				Data:       dp.rawEvent,
-				Timestamp:  t.UnixNano(),
-			}
-			eventsChan <- event
-
-			eventSent += 1
-			if shared > 0 && eventSent >= shared {
-				break LOOP
-			}
-
-			if eventSent%100000 == 0 {
-				duration := time.Now().UnixNano() - startTime
-				fmt.Printf("Generated %d events in %d nano-seconds, actual_eps=%d, required_eps=%d\n",
-					eventSent, duration, eventSent*1000000000/duration, dp.eps)
-			}
+		default:
 		}
 	}
 
-	duration := time.Now().UnixNano() - startTime
+	duration := time.Now().UnixNano() - start
 	fmt.Printf("Done with generation. Generated %d events in %d nano-seconds, actual_eps=%d, required_eps=%d\n",
 		eventSent, duration, eventSent*1000000000/duration, dp.eps)
-
-	ticker.Stop()
 	dp.workersWG.Done()
 }
 
@@ -169,27 +196,13 @@ func (dp *SplunkDataPump) indexEventsAsFastAsPossible(idx int) {
 	eventsChan := make(chan *splunk.Event, 100000)
 	go dp.doIndexEvents(eventsChan, idx)
 
-	shared := int64(-1)
-	if dp.totalEvents > 0 {
-		if idx == 0 {
-			shared = dp.totalEvents%dp.concurrency() + dp.totalEvents/dp.concurrency()
-		} else {
-			shared = dp.totalEvents / dp.concurrency()
-		}
-	}
-
+	shared := dp.getShare(idx)
 	eventSent := int64(0)
 	startTime := time.Now().UnixNano()
 
 LOOP:
 	for {
-		event := &splunk.Event{
-			Index:      dp.index,
-			Sourcetype: dp.sourcetype,
-			Source:     dp.source,
-			Data:       dp.rawEvent,
-			Timestamp:  time.Now().UnixNano(),
-		}
+		event := dp.newEvent()
 
 		select {
 		case eventsChan <- event:
