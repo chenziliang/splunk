@@ -46,8 +46,9 @@ LOOP:
 			continue
 		}
 
+		sent += len(events)
 		if sent >= totalEvents {
-			fmt.Printf("workerId=%d done with work\n", idx)
+			fmt.Printf("workerId=%d done with total_events=%d\n", idx, totalEvents)
 			break LOOP
 		}
 	}
@@ -75,6 +76,7 @@ OUTLOOP:
 			continue
 		}
 
+		sent += len(events)
 		outstandingAckIDs = append(outstandingAckIDs, ids...)
 		if len(outstandingAckIDs)%p.pollLimit != 0 {
 			continue
@@ -82,8 +84,7 @@ OUTLOOP:
 
 		pollId := uuid.New().String()
 		fmt.Printf("workerId=%d pollId=%s Poll outstandingACKs=%d\n", idx, pollId, len(outstandingAckIDs))
-		ticker := time.NewTicker(500 * time.Millisecond)
-		sent += len(events)
+		ticker := time.NewTicker(p.pollInterval)
 
 	LOOP:
 		for {
@@ -104,7 +105,7 @@ OUTLOOP:
 		}
 
 		if sent >= totalEvents {
-			fmt.Printf("workerId=%d done with work\n", idx)
+			fmt.Printf("workerId=%d done with total_events=%d\n", idx, totalEvents)
 			break OUTLOOP
 		}
 	}
@@ -112,23 +113,25 @@ OUTLOOP:
 }
 
 type hecPerf struct {
-	hecURI      string
-	hecToken    string
-	concurrency int
-	pollLimit   int
-	totalEvents int
-	syncMode    bool
-	workers     sync.WaitGroup
+	hecURI       string
+	hecToken     string
+	concurrency  int
+	pollLimit    int
+	pollInterval time.Duration
+	totalEvents  int
+	syncMode     bool
+	workers      sync.WaitGroup
 }
 
-func newHecPerf(hecURI, hecToken string, concurrency, pollLimit, totalEvents int, syncMode bool) *hecPerf {
+func newHecPerf(hecURI, hecToken string, concurrency, totalEvents, pollLimit int, pollInterval time.Duration, syncMode bool) *hecPerf {
 	return &hecPerf{
-		hecURI:      hecURI,
-		hecToken:    hecToken,
-		concurrency: concurrency,
-		pollLimit:   pollLimit,
-		totalEvents: totalEvents,
-		syncMode:    syncMode,
+		hecURI:       hecURI,
+		hecToken:     hecToken,
+		concurrency:  concurrency,
+		pollLimit:    pollLimit,
+		pollInterval: pollInterval,
+		totalEvents:  totalEvents,
+		syncMode:     syncMode,
 	}
 }
 
@@ -153,15 +156,23 @@ func main() {
 	hecToken := kingpin.Flag("hec-token", "HEC input token").Required().String()
 	concurrency := kingpin.Flag("concurrency", "How many concurrent HEC post").Default("1").Int()
 	pollLimit := kingpin.Flag("poll-limit", "After sending how many events, it begins to poll").Default("10000").Int()
+	pollInterval := kingpin.Flag("poll-interval", "How many seconds to wait before each poll").Default("1s").Duration()
 	totalEvents := kingpin.Flag("total-events", "After sending how many events, it stops").Default("10000000").Int()
 	syncMode := kingpin.Flag("sync-mode", "sync or async HEC mode").Default("true").Bool()
 
 	kingpin.Parse()
 
-	perf := newHecPerf(*hecURI, *hecToken, *concurrency, *pollLimit, *totalEvents, *syncMode)
-	fmt.Printf("Start producing total_events=%d concurrency=%d poll_limit=%d sync_mode=%t\n", *totalEvents, *concurrency, *pollLimit, *syncMode)
+	if *totalEvents / *concurrency < *pollLimit {
+		fmt.Printf("total-events / concurrency should be greater than poll-limit\n")
+		return
+	}
+
+	perf := newHecPerf(*hecURI, *hecToken, *concurrency, *totalEvents, *pollLimit, *pollInterval, *syncMode)
+	fmt.Printf("Start producing total_events=%d concurrency=%d poll_limit=%d sync_mode=%t\n",
+		*totalEvents, *concurrency, *pollLimit, *syncMode)
 	start := time.Now().UnixNano()
 	perf.Start()
 	cost := time.Now().UnixNano() - start
-	fmt.Printf("End of producing total_events=%d concurrency=%d poll-limit=%d sync_mode=%t took=%d nanoseconds\n", *totalEvents, *concurrency, *pollLimit, *syncMode, cost)
+	fmt.Printf("End of producing total_events=%d concurrency=%d poll-limit=%d sync_mode=%t took=%d nanoseconds eps=%d\n",
+		*totalEvents, *concurrency, *pollLimit, *syncMode, cost, int64(*totalEvents)*int64(1000000000)/cost)
 }

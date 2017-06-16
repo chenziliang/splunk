@@ -12,7 +12,7 @@ import (
 var (
 	hecHeaders = map[string]string{
 		"Content-Type": "application/json",
-		"Connection": "keep-alive",
+		"Connection":   "keep-alive",
 	}
 )
 
@@ -73,7 +73,7 @@ func getHeaders(headers map[string]string) map[string]string {
 		return hecHeaders
 	}
 
-	h := make(map[string]string, len(hecHeaders) + len(headers))
+	h := make(map[string]string, len(hecHeaders)+len(headers))
 	for k, v := range hecHeaders {
 		h[k] = v
 	}

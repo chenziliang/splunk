@@ -1,10 +1,8 @@
 package splunk
 
-
 type HttpEventAsyncClient struct {
 	*httpEventClient
 }
-
 
 func NewHttpEventAsyncClient(serverURIs, tokens []string) (*HttpEventAsyncClient, error) {
 	httpClient, err := newHttpEventClient(serverURIs, tokens)
