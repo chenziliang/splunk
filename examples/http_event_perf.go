@@ -11,11 +11,11 @@ import (
 	"github.com/chenziliang/splunk"
 )
 
-func getEvents(sourcetype, transaction string) []*splunk.Event {
+func getEvents(sourcetype, transaction string, batchSize int) []*splunk.Event {
 	data := map[string]interface{}{"cf_origin": "firehose", "deployment": "cf", "event_type": "ValueMetric", "ip": "192.168.16.26", "job": "doppler", "job_index": "5a634d0b-bbc5-47c4-9450-a43f44a7fd30", "name": "messageRouter.numberOfFirehoseSinks", "origin": "DopplerServer", "unit": "sinks", "value": 1, "transaction": transaction}
 
 	var events []*splunk.Event
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < batchSize; i++ {
 		event := &splunk.Event{
 			Timestamp:  time.Now().UnixNano(),
 			Source:     "hec-client",
@@ -39,7 +39,7 @@ func (p *HecPerf) asyncPost(idx, totalEvents int) {
 
 LOOP:
 	for {
-		events := getEvents("hec:async", p.transaction)
+		events := getEvents("hec:async", p.transaction, p.batchSize)
 		err := client.WriteEvents(events)
 		if err != nil {
 			fmt.Printf("workerId=%d Failed to write events, error=%+v\n", idx, err)
@@ -69,7 +69,7 @@ func (p *HecPerf) syncPost(idx, totalEvents int) {
 
 OUTLOOP:
 	for {
-		events := getEvents("hec:sync", p.transaction)
+		events := getEvents("hec:sync", p.transaction, p.batchSize)
 		ids, err := client.WriteEvents(events)
 		if err != nil {
 			fmt.Printf("workerId=%d Failed to write events, error=%+v\n", idx, err)
@@ -116,6 +116,7 @@ type HecPerf struct {
 	hecURI       string
 	hecToken     string
 	concurrency  int
+	batchSize    int
 	pollLimit    int
 	pollInterval time.Duration
 	totalEvents  int
@@ -129,6 +130,7 @@ func NewHecPerf(hecURI, hecToken string) *HecPerf {
 		hecURI:       hecURI,
 		hecToken:     hecToken,
 		concurrency:  1,
+		batchSize:    1000,
 		pollLimit:    10000,
 		pollInterval: time.Second,
 		totalEvents:  1000000,
@@ -139,6 +141,11 @@ func NewHecPerf(hecURI, hecToken string) *HecPerf {
 
 func (p *HecPerf) WithConcurrency(concurrency int) *HecPerf {
 	p.concurrency = concurrency
+	return p
+}
+
+func (p *HecPerf) WithBatchSize(batchSize int) *HecPerf {
+	p.batchSize = batchSize
 	return p
 }
 
@@ -195,12 +202,13 @@ func (p *HecPerf) writeMeta(event *splunk.Event) error {
 func (p *HecPerf) writeTxn(meta map[string]interface{}) error {
 	data := map[string]interface{}{
 		"concurrency":   p.concurrency,
+		"batch-size":    p.batchSize,
 		"poll-limit":    p.pollLimit,
 		"poll-interval": int(p.pollInterval / time.Millisecond),
 		"total-events":  p.totalEvents,
 		"sync-mode":     p.syncMode,
 		"transaction":   p.transaction,
-		"time": time.Now().UnixNano(),
+		"time":          time.Now().UnixNano(),
 	}
 
 	for k, v := range meta {
@@ -208,10 +216,10 @@ func (p *HecPerf) writeTxn(meta map[string]interface{}) error {
 	}
 
 	event := &splunk.Event{
-		Timestamp:  time.Now().Unix(),
-		Source:     "hec-client",
-		Host:       "localhost",
-		Data:       data,
+		Timestamp: time.Now().Unix(),
+		Source:    "hec-client",
+		Host:      "localhost",
+		Data:      data,
 	}
 
 	return p.writeMeta(event)
@@ -229,13 +237,13 @@ func (p *HecPerf) Start() error {
 		}
 
 		cost := time.Now().UnixNano() - start
-		eps := int64(p.totalEvents)*int64(1000000000)/cost
+		eps := int64(p.totalEvents) * int64(1000000000) / cost
 		fmt.Printf("End of producing txn=%s total-events=%d concurrency=%d poll-limit=%d sync-mode=%t took=%d nanoseconds eps=%d\n",
 			p.transaction, p.totalEvents, p.concurrency, p.pollLimit, p.syncMode, cost, eps)
 
 		data := map[string]interface{}{
 			"cost": cost,
-			"eps": eps,
+			"eps":  eps,
 		}
 
 		p.writeTxn(data)
@@ -265,6 +273,7 @@ func main() {
 	hecURI := kingpin.Flag("hec-uri", "HEC Server URI, for example: https://localhost:8088").Required().String()
 	hecToken := kingpin.Flag("hec-token", "HEC input token").Required().String()
 	concurrency := kingpin.Flag("concurrency", "How many concurrent HEC post").Default("1").Int()
+	batchSize := kingpin.Flag("batch-size", "How many events per post").Default("1000").Int()
 	pollLimit := kingpin.Flag("poll-limit", "After sending how many events, it begins to poll").Default("10000").Int()
 	pollInterval := kingpin.Flag("poll-interval", "How many seconds to wait before each poll").Default("1s").Duration()
 	totalEvents := kingpin.Flag("total-events", "After sending how many events, it stops").Default("10000000").Int()
@@ -279,6 +288,7 @@ func main() {
 
 	perf := NewHecPerf(*hecURI, *hecToken)
 	perf.WithConcurrency(*concurrency).
+		WithBatchSize(*batchSize).
 		WithPollLimit(*pollLimit).
 		WithPollInterval(*pollInterval).
 		WithTotalEvents(*totalEvents).
